@@ -32,6 +32,7 @@ func main() {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		fmt.Println(id)
 		fmt.Fprintf(w, "%d", id)
 	})
 
