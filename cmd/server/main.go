@@ -14,6 +14,7 @@ func main() {
 	// 命令行参数
 	mongoURI := flag.String("mongo", "mongodb://test:123456@192.168.110.128:27017/?authMechanism=SCRAM-SHA-1", "MongoDB URI")
 	bizTag := flag.String("biz", "default", "Business tag")
+	host := flag.String("host", "0.0.0.0", "HTTP server host")
 	port := flag.Int("port", 8080, "HTTP server port")
 	flag.Parse()
 
@@ -62,7 +63,7 @@ func main() {
 	})
 
 	// 启动服务
-	addr := fmt.Sprintf(":%d", *port)
+	addr := fmt.Sprintf("%s:%d", *host, *port)
 	log.Printf("Starting server on %s", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
