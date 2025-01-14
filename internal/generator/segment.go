@@ -51,27 +51,28 @@ func NewSegmentIDGenerator(mongoURI, bizTag string) (*SegmentIDGenerator, error)
 }
 
 func (g *SegmentIDGenerator) NextID() (int64, error) {
-	current := g.currentSegment.Load()
-	if current == nil {
-		return 0, fmt.Errorf("no available segment")
-	}
-
-	// 获取下一个ID
-	id := atomic.AddInt64(&current.Current, 1)
-	if id > current.Max {
-		// 如果超出当前号段范围，尝试切换到下一个号段
-		if err := g.switchSegment(); err != nil {
-			return 0, err
+	for i := 0; i < 2; i++ { // 最多重试一次
+		current := g.currentSegment.Load()
+		if current == nil {
+			return 0, fmt.Errorf("no available segment")
 		}
-		return g.NextID()
+
+		id := atomic.AddInt64(&current.Current, 1)
+		if id <= current.Max {
+			// 检查是否需要预加载下一个号段
+			if g.shouldLoadNext(current) {
+				go g.loadNextSegment()
+			}
+			return id, nil
+		}
+
+		// 超出范围，切换号段
+		if err := g.switchSegment(); err != nil {
+			return 0, fmt.Errorf("failed to switch segment: %v", err)
+		}
 	}
 
-	// 检查是否需要预加载下一个号段
-	if g.shouldLoadNext(current) {
-		go g.loadNextSegment()
-	}
-
-	return id, nil
+	return 0, fmt.Errorf("failed to generate id after retry")
 }
 
 func (g *SegmentIDGenerator) shouldLoadNext(segment *Segment) bool {
@@ -88,14 +89,24 @@ func (g *SegmentIDGenerator) shouldLoadNext(segment *Segment) bool {
 }
 
 func (g *SegmentIDGenerator) switchSegment() error {
-	// 如果没有下一个号段，等待加载
-	for g.nextSegment.Load() == nil {
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		if g.nextSegment.Load() != nil {
+			break
+		}
 		if err := g.loadNextSegment(); err != nil {
-			return err
+			if i == maxRetries-1 {
+				return fmt.Errorf("switch segment failed after %d retries: %v", maxRetries, err)
+			}
+			time.Sleep(time.Millisecond * 100 * time.Duration(i+1))
+			continue
 		}
 	}
 
-	// 切换号段
+	if g.nextSegment.Load() == nil {
+		return fmt.Errorf("failed to load next segment")
+	}
+
 	g.currentSegment.Store(g.nextSegment.Load())
 	g.nextSegment.Store(nil)
 	return nil
@@ -106,6 +117,9 @@ func (g *SegmentIDGenerator) loadNextSegment() error {
 		return nil
 	}
 	defer g.loadingFlag.Store(false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
 	filter := bson.M{"_id": g.bizTag}
 	update := bson.M{
@@ -122,9 +136,8 @@ func (g *SegmentIDGenerator) loadNextSegment() error {
 	}
 
 	coll := g.mongoClient.Database("test").Collection("segments")
-
 	err := coll.FindOneAndUpdate(
-		context.Background(),
+		ctx,
 		filter,
 		update,
 		options.FindOneAndUpdate().
@@ -134,6 +147,11 @@ func (g *SegmentIDGenerator) loadNextSegment() error {
 
 	if err != nil {
 		return fmt.Errorf("load segment failed: %v", err)
+	}
+
+	// 验证返回值的合法性
+	if result.MaxID <= 0 {
+		return fmt.Errorf("invalid maxId: %d", result.MaxID)
 	}
 
 	newSegment := &Segment{
