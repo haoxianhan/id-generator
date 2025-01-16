@@ -3,7 +3,10 @@ package generator
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +14,44 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 )
+
+// 添加通用的验证方法
+func validateIDs(t *testing.T, ids []int64, expectedCount int) {
+	t.Helper()
+
+	t.Run("验证ID数量", func(t *testing.T) {
+		if len(ids) != expectedCount {
+			t.Errorf("期望生成 %d 个ID，实际生成 %d 个", expectedCount, len(ids))
+		}
+	})
+
+	t.Run("验证ID唯一性和递增性", func(t *testing.T) {
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		for i := 1; i < len(ids); i++ {
+			if ids[i] == ids[i-1] {
+				t.Errorf("发现重复ID: %d", ids[i])
+			}
+			if ids[i] <= ids[i-1] {
+				t.Errorf("ID序列不是严格递增的: ids[%d]=%d, ids[%d]=%d",
+					i-1, ids[i-1], i, ids[i])
+			}
+		}
+	})
+}
+
+// 添加性能统计方法
+func logPerformanceStats(t *testing.T, ids []int64, duration time.Duration) {
+	t.Helper()
+
+	idsPerSecond := float64(len(ids)) / duration.Seconds()
+	t.Logf("性能统计:\n"+
+		"总耗时: %v\n"+
+		"总ID数: %d\n"+
+		"每秒生成ID数: %.2f\n"+
+		"最小ID: %d\n"+
+		"最大ID: %d",
+		duration, len(ids), idsPerSecond, ids[0], ids[len(ids)-1])
+}
 
 func TestSegmentIDGeneratorConcurrent(t *testing.T) {
 	// 测试配置
@@ -63,31 +104,8 @@ func TestSegmentIDGeneratorConcurrent(t *testing.T) {
 	wg.Wait()
 	duration := time.Since(startTime)
 
-	// 验证结果
-	t.Run("验证ID数量", func(t *testing.T) {
-		if len(ids) != totalIDs {
-			t.Errorf("期望生成 %d 个ID，实际生成 %d 个", totalIDs, len(ids))
-		}
-	})
-
-	t.Run("验证ID唯一性", func(t *testing.T) {
-		// 排序后检查是否有重复
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		for i := 1; i < len(ids); i++ {
-			if ids[i] == ids[i-1] {
-				t.Errorf("发现重复ID: %d", ids[i])
-			}
-		}
-	})
-
-	t.Run("验证ID递增性", func(t *testing.T) {
-		for i := 1; i < len(ids); i++ {
-			if ids[i] <= ids[i-1] {
-				t.Errorf("ID序列不是严格递增的: ids[%d]=%d, ids[%d]=%d",
-					i-1, ids[i-1], i, ids[i])
-			}
-		}
-	})
+	// 使用通用验证方法
+	validateIDs(t, ids, goroutineCount*idsPerGoroutine)
 
 	// 验证MongoDB中的记录
 	t.Run("验证MongoDB记录", func(t *testing.T) {
@@ -115,13 +133,71 @@ func TestSegmentIDGeneratorConcurrent(t *testing.T) {
 		}
 	})
 
-	// 输出性能统计
-	idsPerSecond := float64(totalIDs) / duration.Seconds()
-	t.Logf("性能统计:\n"+
-		"总耗时: %v\n"+
-		"总ID数: %d\n"+
-		"每秒生成ID数: %.2f\n"+
-		"最小ID: %d\n"+
-		"最大ID: %d",
-		duration, totalIDs, idsPerSecond, ids[0], ids[len(ids)-1])
+	// 使用通用性能统计方法
+	logPerformanceStats(t, ids, duration)
+}
+
+func TestSegmentIDGeneratorWithHTTP(t *testing.T) {
+
+	// 测试参数
+	goroutineCount := 20
+	requestsPerGoroutine := 5000
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	var wg sync.WaitGroup
+	ids := make(chan int64, goroutineCount*requestsPerGoroutine)
+	startTime := time.Now()
+
+	// 并发发送请求
+	for i := 0; i < goroutineCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < requestsPerGoroutine; j++ {
+				resp, err := client.Get("http://localhost:8080/id")
+				if err != nil {
+					t.Errorf("Request failed: %v", err)
+					continue
+				}
+
+				// 读取响应体
+				body, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err != nil {
+					t.Errorf("Failed to read response body: %v", err)
+					continue
+				}
+
+				// 直接将响应转换为int64
+				id, err := strconv.ParseInt(string(body), 10, 64)
+				if err != nil {
+					t.Errorf("Failed to parse ID: %v", err)
+					continue
+				}
+				ids <- id
+			}
+		}()
+	}
+
+	// 等待所有请求完成
+	go func() {
+		wg.Wait()
+		close(ids)
+	}()
+
+	// 收集和验证结果
+	var receivedIDs []int64
+	for id := range ids {
+		receivedIDs = append(receivedIDs, id)
+	}
+
+	duration := time.Since(startTime)
+
+	// 使用通用验证方法
+	validateIDs(t, receivedIDs, goroutineCount*requestsPerGoroutine)
+
+	// 使用通用性能统计方法
+	logPerformanceStats(t, receivedIDs, duration)
 }
